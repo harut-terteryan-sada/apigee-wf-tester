@@ -1,0 +1,14 @@
+name: Test Lint
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to post the comment on (0 = skip)
+        type: number
+        default: 0
+jobs:
+  spectral:
+    uses: ./.github/workflows/spectral-lint.yml
+    with:
+      spec_path: specs/openapi.yaml
+      pr_number: ${{ inputs.pr_number }}
