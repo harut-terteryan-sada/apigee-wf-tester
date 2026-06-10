@@ -1,0 +1,4 @@
+<APIProxy revision="1" name="sample">
+  <DisplayName>sample</DisplayName>
+  <Description>Sample API proxy for apigeelint testing</Description>
+</APIProxy>

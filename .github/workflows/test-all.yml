@@ -1,0 +1,29 @@
+name: Test All (non-GCP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to post lint comments on (0 = skip)
+        type: string
+        default: "0"
+
+jobs:
+  spectral:
+    uses: ./.github/workflows/spectral-lint.yml
+    with:
+      spec_path: specs/openapi.yaml
+      pr_number: ${{ fromJSON(inputs.pr_number) }}
+
+  bundle-lint:
+    uses: ./.github/workflows/apigee-bundle-lint.yml
+    with:
+      bundle_path: bundle/apiproxy
+      fail_on_severity: error
+      pr_number: ${{ fromJSON(inputs.pr_number) }}
+
+  healthcheck:
+    uses: ./.github/workflows/apigee-healthcheck.yml
+    with:
+      health_endpoint: https://www.google.com
+      expected_status: "200"
