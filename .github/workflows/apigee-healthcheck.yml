@@ -1,0 +1,135 @@
+name: Apigee Healthcheck
+
+on:
+  workflow_call:
+    inputs:
+      health_endpoint:
+        description: 'Full URL to the Apigee proxy health/smoke endpoint (e.g., https://api2-hack.madhive.com/burns/v1/health)'
+        required: true
+        type: string
+      expected_status:
+        description: 'Expected HTTP status code (e.g., 200, 201). Leave empty to accept any 2xx'
+        required: false
+        type: string
+        default: '200'
+      newman_collection:
+        description: 'Optional: Path to Newman collection JSON file (e.g., postman-collection.json). If provided, runs Newman instead of curl'
+        required: false
+        type: string
+      timeout_seconds:
+        description: 'Curl/Newman timeout in seconds'
+        required: false
+        type: string
+        default: '30'
+    secrets:
+      bearer_token:
+        description: 'Bearer token for Authorization header (if needed)'
+        required: false
+    outputs:
+      passed:
+        description: 'true if health check passed, false otherwise'
+        value: ${{ jobs.healthcheck.outputs.passed }}
+      http_status:
+        description: 'HTTP status code received (if curl was used)'
+        value: ${{ jobs.healthcheck.outputs.http_status }}
+      response_time_ms:
+        description: 'Response time in milliseconds'
+        value: ${{ jobs.healthcheck.outputs.response_time_ms }}
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.health.outputs.passed || steps.health_curl.outputs.passed }}
+      http_status: ${{ steps.health.outputs.http_status || steps.health_curl.outputs.http_status }}
+      response_time_ms: ${{ steps.health.outputs.response_time_ms || steps.health_curl.outputs.response_time_ms }}
+    steps:
+      - name: Checkout repository
+        if: ${{ inputs.newman_collection != '' }}
+        uses: actions/checkout@v4
+
+      - name: Run Newman healthcheck
+        id: health
+        if: ${{ inputs.newman_collection != '' }}
+        run: |
+          npm install -g newman
+          
+          # Run Newman collection
+          set +e
+          START_TIME=$(date +%s%N)
+          newman run "${{ inputs.newman_collection }}" \
+            --reporters cli,json \
+            --reporter-json-export newman-report.json \
+            --timeout "${{ inputs.timeout_seconds }}000" \
+            2>&1 | tee newman-output.log
+          NEWMAN_EXIT=$?
+          END_TIME=$(date +%s%N)
+          RESPONSE_TIME_MS=$(( (END_TIME - START_TIME) / 1000000 ))
+          
+          echo "response_time_ms=$RESPONSE_TIME_MS" >> "$GITHUB_OUTPUT"
+
+          # Signal pass/fail via OS exit code (report still uploads via always()).
+          if [ $NEWMAN_EXIT -eq 0 ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✓ Healthcheck passed"
+            exit 0
+          fi
+          echo "passed=false" >> "$GITHUB_OUTPUT"
+          echo "❌ Healthcheck failed (newman exit $NEWMAN_EXIT)"
+          exit 1
+      
+      - name: Run curl healthcheck
+        id: health_curl
+        if: ${{ inputs.newman_collection == '' }}
+        env:
+          BEARER_TOKEN: ${{ secrets.bearer_token }}
+        run: |
+          set +e
+
+          # Execute curl directly — no eval to avoid injection risk
+          CURL_ARGS=(-s -w '%{http_code}' -o response.txt --max-time "${{ inputs.timeout_seconds }}")
+          if [ -n "$BEARER_TOKEN" ]; then
+            CURL_ARGS+=(-H "Authorization: Bearer $BEARER_TOKEN")
+          fi
+
+          START_TIME=$(date +%s%N)
+          HTTP_STATUS=$(curl "${CURL_ARGS[@]}" "${{ inputs.health_endpoint }}")
+          CURL_EXIT=$?
+          END_TIME=$(date +%s%N)
+          RESPONSE_TIME_MS=$(( (END_TIME - START_TIME) / 1000000 ))
+
+          # Determine pass/fail
+          EXPECTED="${{ inputs.expected_status }}"
+          PASSED=false
+          if [ $CURL_EXIT -ne 0 ]; then
+            HTTP_STATUS="timeout-or-error"
+          elif [ -z "$EXPECTED" ]; then
+            [[ $HTTP_STATUS =~ ^2 ]] && PASSED=true
+          elif [ "$HTTP_STATUS" = "$EXPECTED" ]; then
+            PASSED=true
+          fi
+
+          {
+            echo "passed=$PASSED"
+            echo "http_status=$HTTP_STATUS"
+            echo "response_time_ms=$RESPONSE_TIME_MS"
+          } >> "$GITHUB_OUTPUT"
+
+          # Signal pass/fail via OS exit code (report still uploads via always()).
+          if [ "$PASSED" = "true" ]; then
+            echo "✓ Healthcheck passed (HTTP $HTTP_STATUS)"
+            exit 0
+          fi
+          echo "❌ Healthcheck failed (HTTP $HTTP_STATUS)"
+          exit 1
+      
+      - name: Upload healthcheck report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: healthcheck-report
+          path: |
+            response.txt
+            newman-report.json
+            newman-output.log
+          retention-days: 30

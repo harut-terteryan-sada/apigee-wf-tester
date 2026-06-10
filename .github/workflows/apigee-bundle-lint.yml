@@ -1,0 +1,178 @@
+name: Apigee Bundle Lint
+
+on:
+  workflow_call:
+    inputs:
+      bundle_path:
+        description: Path to the Apigee bundle directory
+        required: true
+        type: string
+      profile:
+        description: apigeelint profile to use
+        required: false
+        type: string
+        default: apigeex
+      plugins_dir:
+        description: Optional path to external apigeelint plugins
+        required: false
+        type: string
+        default: ""
+      fail_on_severity:
+        description: Severity threshold that fails the workflow (error, warning, info)
+        required: false
+        type: string
+        default: error
+      pr_number:
+        description: Optional PR number for posting a summary comment
+        required: false
+        type: number
+        default: 0
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      error_count: ${{ steps.parse.outputs.error_count }}
+      warning_count: ${{ steps.parse.outputs.warning_count }}
+      info_count: ${{ steps.parse.outputs.info_count }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          npm install -g apigeelint
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d "${{ inputs.bundle_path }}" ]]; then
+            echo "ERROR: bundle_path does not exist or is not a directory: ${{ inputs.bundle_path }}"
+            exit 1
+          fi
+
+      - name: Run apigeelint
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.plugins_dir }}" ]]; then
+            if [[ -d "${{ inputs.plugins_dir }}" ]]; then
+              EXTRA_ARGS="--externalPluginsDirectory ${{ inputs.plugins_dir }}"
+            else
+              echo "WARNING: plugins_dir does not exist, continuing without plugins: ${{ inputs.plugins_dir }}"
+            fi
+          fi
+
+          # shellcheck disable=SC2086
+          # Allow non-zero exit so results are always captured; threshold check happens in a later step
+          apigeelint -s "${{ inputs.bundle_path }}" -f json.js --profile "${{ inputs.profile }}" $EXTRA_ARGS > lint-results.json || true
+
+      - name: Parse lint results
+        id: parse
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ERRORS=$(jq '[.. | objects | select(has("severity")) | .severity | tonumber | select(. == 2)] | length' lint-results.json)
+          WARNINGS=$(jq '[.. | objects | select(has("severity")) | .severity | tonumber | select(. == 1)] | length' lint-results.json)
+          INFO=$(jq '[.. | objects | select(has("severity")) | .severity | tonumber | select(. == 0)] | length' lint-results.json)
+
+          {
+            echo "error_count=$ERRORS"
+            echo "warning_count=$WARNINGS"
+            echo "info_count=$INFO"
+          } >> "$GITHUB_OUTPUT"
+
+          # Full markdown report: counts table + per-finding table (flattened across files).
+          {
+            echo "### Apigee Bundle Lint"
+            echo ""
+            echo "| Severity | Count |"
+            echo "|---|---:|"
+            echo "| Errors | $ERRORS |"
+            echo "| Warnings | $WARNINGS |"
+            echo "| Info | $INFO |"
+            echo ""
+            jq -r '
+              def sev: {"2":"error","1":"warn","0":"info"}[.severity | tostring];
+              [ .[] | . as $f | ($f.messages // [])[] | {file: ($f.filePath // ""), m: .} ] as $rows
+              | if ($rows | length) == 0 then "✅ No issues found."
+                else
+                  "| Severity | Rule | Message | File:Line |\n|---|---|---|---|\n" +
+                  ([ $rows[] | "| \(.m | sev) | `\(.m.ruleId // "")` | \(.m.message | gsub("\\|"; "\\|")) | \(.file | split("/") | last):\(.m.line // "") |" ] | join("\n"))
+                end
+            ' lint-results.json
+          } > lint-report.md
+
+          cat lint-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-lint-report
+          path: |
+            lint-report.md
+            lint-results.json
+          if-no-files-found: error
+
+      - name: Fail on threshold
+        shell: bash
+        env:
+          ERRORS: ${{ steps.parse.outputs.error_count }}
+          WARNINGS: ${{ steps.parse.outputs.warning_count }}
+          INFO: ${{ steps.parse.outputs.info_count }}
+        run: |
+          set -euo pipefail
+          case "${{ inputs.fail_on_severity }}" in
+            error)
+              [[ "$ERRORS" -eq 0 ]] || { echo "Failing due to error severity threshold"; exit 1; }
+              ;;
+            warning)
+              [[ $((ERRORS + WARNINGS)) -eq 0 ]] || { echo "Failing due to warning severity threshold"; exit 1; }
+              ;;
+            info)
+              [[ $((ERRORS + WARNINGS + INFO)) -eq 0 ]] || { echo "Failing due to info severity threshold"; exit 1; }
+              ;;
+            *)
+              echo "ERROR: Unsupported fail_on_severity value: ${{ inputs.fail_on_severity }}"
+              exit 1
+              ;;
+          esac
+
+  post-comment:
+    needs: [lint]
+    if: ${{ always() && inputs.pr_number > 0 }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Download report
+        uses: actions/download-artifact@v4
+        with:
+          name: bundle-lint-report
+          path: ./report
+
+      - name: Post full markdown report comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('./report/lint-report.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number('${{ inputs.pr_number }}'),
+              body,
+            });

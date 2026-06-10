@@ -1,0 +1,194 @@
+name: Spectral OAS Lint
+
+on:
+  workflow_call:
+    inputs:
+      spec_path:
+        description: Path to the OpenAPI or YAML spec file
+        required: true
+        type: string
+      ruleset_path:
+        description: Optional path to a Spectral ruleset file
+        required: false
+        type: string
+        default: ""
+      fail_severity:
+        description: Severity threshold that fails the job (error, warn, info, hint)
+        required: false
+        type: string
+        default: error
+      output_sarif:
+        description: Generate SARIF and upload it as an artifact
+        required: false
+        type: boolean
+        default: true
+      pr_number:
+        description: Optional PR number for posting a markdown report comment
+        required: false
+        type: number
+        default: 0
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      error_count: ${{ steps.report.outputs.error_count }}
+      warn_count: ${{ steps.report.outputs.warn_count }}
+      info_count: ${{ steps.report.outputs.info_count }}
+      hint_count: ${{ steps.report.outputs.hint_count }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Spectral CLI
+        run: npm install -g @stoplight/spectral-cli
+
+      - name: Resolve ruleset
+        id: ruleset
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${{ inputs.spec_path }}" ]]; then
+            echo "ERROR: spec_path does not exist: ${{ inputs.spec_path }}"
+            exit 1
+          fi
+
+          if [[ -n "${{ inputs.ruleset_path }}" ]] && [[ -f "${{ inputs.ruleset_path }}" ]]; then
+            RULESET="${{ inputs.ruleset_path }}"
+          else
+            if [[ -n "${{ inputs.ruleset_path }}" ]]; then
+              echo "WARNING: ruleset_path not found, falling back to built-in OAS ruleset: ${{ inputs.ruleset_path }}"
+            fi
+            RULESET="$RUNNER_TEMP/spectral-oas-ruleset.yaml"
+            echo "extends: ['spectral:oas']" > "$RULESET"
+          fi
+          echo "ruleset=$RULESET" >> "$GITHUB_OUTPUT"
+
+      - name: Run Spectral (capture findings)
+        shell: bash
+        env:
+          RULESET: ${{ steps.ruleset.outputs.ruleset }}
+        run: |
+          set -euo pipefail
+          # Capture all findings as JSON without gating yet (threshold enforced later).
+          spectral lint "${{ inputs.spec_path }}" --ruleset "$RULESET" \
+            --format json --output spectral.json || true
+          [[ -f spectral.json ]] || echo '[]' > spectral.json
+
+      - name: Build markdown report
+        id: report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ERR=$(jq '[.[] | select(.severity == 0)] | length' spectral.json)
+          WARN=$(jq '[.[] | select(.severity == 1)] | length' spectral.json)
+          INFO=$(jq '[.[] | select(.severity == 2)] | length' spectral.json)
+          HINT=$(jq '[.[] | select(.severity == 3)] | length' spectral.json)
+
+          {
+            echo "error_count=$ERR"
+            echo "warn_count=$WARN"
+            echo "info_count=$INFO"
+            echo "hint_count=$HINT"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Spectral OAS Lint"
+            echo ""
+            echo "**Spec:** \`${{ inputs.spec_path }}\`"
+            echo ""
+            echo "| Severity | Count |"
+            echo "|---|---:|"
+            echo "| Errors | $ERR |"
+            echo "| Warnings | $WARN |"
+            echo "| Info | $INFO |"
+            echo "| Hints | $HINT |"
+            echo ""
+            jq -r '
+              def sev: {"0":"error","1":"warn","2":"info","3":"hint"}[.severity | tostring];
+              if length == 0 then "✅ No issues found."
+              else
+                "| Severity | Code | Message | Line |\n|---|---|---|---:|\n" +
+                ([ .[] | "| \(sev) | `\(.code)` | \(.message | gsub("\\|"; "\\|")) | \(.range.start.line + 1) |" ] | join("\n"))
+              end
+            ' spectral.json
+          } > spectral-report.md
+
+          cat spectral-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate SARIF
+        if: ${{ inputs.output_sarif && always() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          RULESET: ${{ steps.ruleset.outputs.ruleset }}
+        run: |
+          set -euo pipefail
+          spectral lint "${{ inputs.spec_path }}" --ruleset "$RULESET" \
+            --format sarif --output spectral-results.sarif || true
+
+      - name: Upload reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: spectral-lint-report
+          path: |
+            spectral-report.md
+            spectral.json
+            spectral-results.sarif
+          if-no-files-found: warn
+
+      - name: Enforce severity threshold
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.fail_severity }}" in
+            error) THRESH=0 ;;
+            warn)  THRESH=1 ;;
+            info)  THRESH=2 ;;
+            hint)  THRESH=3 ;;
+            *)     THRESH=0 ;;
+          esac
+          COUNT=$(jq --argjson t "$THRESH" '[.[] | select(.severity <= $t)] | length' spectral.json)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Failing: $COUNT finding(s) at or above '${{ inputs.fail_severity }}' severity"
+            exit 1
+          fi
+          echo "No findings at or above '${{ inputs.fail_severity }}' severity"
+
+  post-comment:
+    needs: [lint]
+    if: ${{ always() && inputs.pr_number > 0 }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Download report
+        uses: actions/download-artifact@v4
+        with:
+          name: spectral-lint-report
+          path: ./report
+
+      - name: Post markdown comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('./report/spectral-report.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number('${{ inputs.pr_number }}'),
+              body,
+            });

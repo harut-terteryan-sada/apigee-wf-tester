@@ -1,0 +1,144 @@
+name: Go-Gen Render Bundle
+
+on:
+  workflow_call:
+    inputs:
+      render_type:
+        description: Render mode (api-proxy or shared-flow)
+        required: true
+        type: string
+      spec_path:
+        description: Path to source spec file
+        required: true
+        type: string
+      output_path:
+        description: Output directory for rendered bundle
+        required: false
+        type: string
+        default: ./build/apiproxy
+      template_path:
+        description: Path to template in local repo or template repo checkout
+        required: true
+        type: string
+      template_repo:
+        description: Optional owner/repo for split template source
+        required: false
+        type: string
+        default: ""
+      template_ref:
+        description: Optional git ref for template_repo
+        required: false
+        type: string
+        default: ""
+      artifact_name:
+        description: Name for uploaded artifact
+        required: false
+        type: string
+        default: apigee-bundle
+      go_version:
+        description: Go version used to install apigee-go-gen
+        required: false
+        type: string
+        default: "stable"
+      apigee_go_gen_version:
+        description: 'apigee-go-gen version to install (e.g. v0.1.7). Defaults to latest — pin this in production callers for reproducible builds.'
+        required: false
+        type: string
+        default: "latest"
+
+    outputs:
+      artifact_name:
+        description: Name of uploaded artifact
+        value: ${{ jobs.render.outputs.artifact_name }}
+      output_path:
+        description: Render output path
+        value: ${{ jobs.render.outputs.output_path }}
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      artifact_name: ${{ steps.set-outputs.outputs.artifact_name }}
+      output_path: ${{ steps.set-outputs.outputs.output_path }}
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Check out templates (split repo)
+        if: ${{ inputs.template_repo != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.template_repo }}
+          ref: ${{ inputs.template_ref }}
+          path: .platform-templates
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+
+      - name: Install apigee-go-gen
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install github.com/apigee/apigee-go-gen@${{ inputs.apigee_go_gen_version }}
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "${{ inputs.spec_path }}" ]]; then
+            echo "ERROR: spec_path does not exist: ${{ inputs.spec_path }}"
+            exit 1
+          fi
+
+          if [[ "${{ inputs.render_type }}" != "api-proxy" && "${{ inputs.render_type }}" != "shared-flow" ]]; then
+            echo "ERROR: render_type must be api-proxy or shared-flow"
+            exit 1
+          fi
+
+      - name: Render bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEMPLATE_PATH="${{ inputs.template_path }}"
+          if [[ -n "${{ inputs.template_repo }}" ]]; then
+            TEMPLATE_PATH=".platform-templates/${{ inputs.template_path }}"
+          fi
+
+          if [[ ! -e "$TEMPLATE_PATH" ]]; then
+            echo "ERROR: template_path does not exist: $TEMPLATE_PATH"
+            exit 1
+          fi
+
+          # Render straight to a zip bundle at <output_path>/<render_type>/<artifact_name>.zip
+          # so the deploy stage consumes a ready zip (no re-zipping downstream).
+          BUNDLE_ZIP="${{ inputs.output_path }}/${{ inputs.render_type }}/${{ inputs.artifact_name }}.zip"
+          mkdir -p "$(dirname "$BUNDLE_ZIP")"
+
+          apigee-go-gen render "${{ inputs.render_type }}" \
+            --template "$TEMPLATE_PATH" \
+            --spec "${{ inputs.spec_path }}" \
+            --output "$BUNDLE_ZIP"
+
+      - name: Upload rendered bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.output_path }}
+          if-no-files-found: error
+
+      - name: Set outputs
+        id: set-outputs
+        run: |
+          {
+            echo "artifact_name=${{ inputs.artifact_name }}"
+            echo "output_path=${{ inputs.output_path }}"
+          } >> "$GITHUB_OUTPUT"

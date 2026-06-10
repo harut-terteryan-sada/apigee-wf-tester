@@ -1,0 +1,123 @@
+name: Apigee Reusable Workflows Smoke (No GCP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_spectral:
+        description: Run spectral-lint
+        type: boolean
+        required: true
+        default: true
+      run_bundle_lint:
+        description: Run apigee-bundle-lint
+        type: boolean
+        required: true
+        default: true
+      run_healthcheck:
+        description: Run apigee-healthcheck
+        type: boolean
+        required: true
+        default: true
+      run_promotion_gate:
+        description: Run environment-promotion-gate
+        type: boolean
+        required: true
+        default: false
+      spec_path:
+        description: Path to OpenAPI spec (spectral)
+        type: string
+        required: true
+        default: services/mozart/pkg/spec/mozart_spec.yaml
+      ruleset_path:
+        description: Optional Spectral ruleset path
+        type: string
+        required: false
+        default: ""
+      fail_severity:
+        description: Spectral fail severity
+        type: choice
+        required: true
+        default: error
+        options:
+          - error
+          - warn
+          - info
+          - hint
+      bundle_path:
+        description: Apigee bundle directory path
+        type: string
+        required: true
+        default: services/workflow/apigee/apiproxy
+      profile:
+        description: apigeelint profile
+        type: string
+        required: true
+        default: apigeex
+      fail_on_severity:
+        description: apigeelint fail severity
+        type: choice
+        required: true
+        default: error
+        options:
+          - error
+          - warning
+          - info
+      health_endpoint:
+        description: Health check URL
+        type: string
+        required: false
+        default: https://httpbin.org/status/200
+      healthcheck_expected_status:
+        description: Expected HTTP status
+        type: string
+        required: false
+        default: "200"
+      healthcheck_timeout:
+        description: Healthcheck timeout (seconds)
+        type: string
+        required: false
+        default: "30"
+      target_environment:
+        description: GHA environment name for promotion gate
+        type: string
+        required: false
+        default: staging
+      promotion_summary:
+        description: Summary for promotion gate
+        type: string
+        required: false
+        default: Apigee deployment ready for approval
+
+jobs:
+  spectral:
+    if: ${{ inputs.run_spectral }}
+    uses: ./.github/workflows/spectral-lint.yml
+    with:
+      spec_path: ${{ inputs.spec_path }}
+      ruleset_path: ${{ inputs.ruleset_path }}
+      fail_severity: ${{ inputs.fail_severity }}
+      output_sarif: true
+
+  bundle-lint:
+    if: ${{ inputs.run_bundle_lint }}
+    uses: ./.github/workflows/apigee-bundle-lint.yml
+    with:
+      bundle_path: ${{ inputs.bundle_path }}
+      profile: ${{ inputs.profile }}
+      fail_on_severity: ${{ inputs.fail_on_severity }}
+      pr_number: 0
+
+  healthcheck:
+    if: ${{ inputs.run_healthcheck && inputs.health_endpoint != '' }}
+    uses: ./.github/workflows/apigee-healthcheck.yml
+    with:
+      health_endpoint: ${{ inputs.health_endpoint }}
+      expected_status: ${{ inputs.healthcheck_expected_status }}
+      timeout_seconds: ${{ inputs.healthcheck_timeout }}
+
+  promotion-gate:
+    if: ${{ inputs.run_promotion_gate }}
+    uses: ./.github/workflows/environment-promotion-gate.yml
+    with:
+      target_environment: ${{ inputs.target_environment }}
+      summary: ${{ inputs.promotion_summary }}

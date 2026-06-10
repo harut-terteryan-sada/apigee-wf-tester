@@ -1,0 +1,37 @@
+name: Environment Promotion Gate
+
+on:
+  workflow_call:
+    inputs:
+      target_environment:
+        description: 'GitHub environment name configured with protection rules (e.g., staging, production)'
+        required: true
+        type: string
+      summary:
+        description: 'Optional summary message to display during approval prompt'
+        required: false
+        type: string
+        default: 'Ready for deployment approval'
+
+jobs:
+  approval-gate:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.target_environment }}
+    steps:
+      - name: Display deployment summary
+        run: |
+          echo "════════════════════════════════════════"
+          echo "Environment Promotion Gate"
+          echo "════════════════════════════════════════"
+          echo ""
+          echo "Target Environment: ${{ inputs.target_environment }}"
+          echo "Summary: ${{ inputs.summary }}"
+          echo ""
+          echo "Awaiting approval from environment reviewers..."
+          echo "════════════════════════════════════════"
+      
+      - name: Gate passed
+        run: |
+          echo "✓ Deployment approved for ${{ inputs.target_environment }}"
+          echo "Downstream jobs may now proceed."
